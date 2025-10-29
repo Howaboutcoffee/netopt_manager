@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ==========================================
-# Linux 网络优化管理器 v8（最终版本）
+# Linux 网络优化管理器 v8（Debian 13 修复版）
 # ------------------------------------------
 # 改进：BBR+FQ 已集成到每个 TCP 优化方案中
-# 不再需要单独配置拥塞控制算法
+# 修复：备份函数改用 cp 而非 cp -a（Debian 13兼容）
+# 修复：确保文件存在才执行 sed 操作
 # ==========================================
 
 set -e
@@ -17,30 +18,41 @@ BACKUP_DIR="/root/netopt_backup_${HOST}_${DATE}"
 backup_configs() {
     mkdir -p "$BACKUP_DIR"
     echo "[备份] 正在备份当前配置到 $BACKUP_DIR ..."
-    cp -a /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak" 2>/dev/null || true
-    cp -a /etc/security/limits.conf "$BACKUP_DIR/limits.conf.bak" 2>/dev/null || true
-    cp -a /etc/systemd/system.conf "$BACKUP_DIR/system.conf.bak" 2>/dev/null || true
-    iptables-save > "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
+    
+    # 改用 cp 而非 cp -a，避免 Debian 13 的潜在问题
+    [ -f /etc/sysctl.conf ] && cp /etc/sysctl.conf "$BACKUP_DIR/sysctl.conf.bak" 2>/dev/null || touch "$BACKUP_DIR/sysctl.conf.bak"
+    [ -f /etc/security/limits.conf ] && cp /etc/security/limits.conf "$BACKUP_DIR/limits.conf.bak" 2>/dev/null || true
+    [ -f /etc/systemd/system.conf ] && cp /etc/systemd/system.conf "$BACKUP_DIR/system.conf.bak" 2>/dev/null || true
+    command -v iptables-save >/dev/null 2>&1 && iptables-save > "$BACKUP_DIR/iptables.bak" 2>/dev/null || true
 
     cat > "$BACKUP_DIR/restore.sh" <<'EOF'
 #!/usr/bin/env bash
 set -e
 [ "$(id -u)" -eq 0 ] || { echo "请以 root 运行此脚本"; exit 1; }
 BASEDIR="$(dirname "$0")"
-cp -a "$BASEDIR/sysctl.conf.bak" /etc/sysctl.conf 2>/dev/null || true
-cp -a "$BASEDIR/limits.conf.bak" /etc/security/limits.conf 2>/dev/null || true
-cp -a "$BASEDIR/system.conf.bak" /etc/systemd/system.conf 2>/dev/null || true
-if [ -f "$BASEDIR/iptables.bak" ]; then iptables-restore < "$BASEDIR/iptables.bak"; fi
+[ -f "$BASEDIR/sysctl.conf.bak" ] && cp "$BASEDIR/sysctl.conf.bak" /etc/sysctl.conf 2>/dev/null || true
+[ -f "$BASEDIR/limits.conf.bak" ] && cp "$BASEDIR/limits.conf.bak" /etc/security/limits.conf 2>/dev/null || true
+[ -f "$BASEDIR/system.conf.bak" ] && cp "$BASEDIR/system.conf.bak" /etc/systemd/system.conf 2>/dev/null || true
+[ -f "$BASEDIR/iptables.bak" ] && command -v iptables-restore >/dev/null 2>&1 && iptables-restore < "$BASEDIR/iptables.bak" || true
 # 清理网卡队列
 for iface in $(ip link show | grep "state UP" | awk -F: '{print $2}' | xargs); do
     tc qdisc del dev $iface root 2>/dev/null || true
 done
 sysctl --system >/dev/null 2>&1 || true
-systemctl daemon-reexec
+systemctl daemon-reexec 2>/dev/null || true
 echo "[成功] 已恢复至备份配置"
 EOF
     chmod +x "$BACKUP_DIR/restore.sh"
     echo "[完成] 备份完成，可用 $BACKUP_DIR/restore.sh 恢复"
+}
+
+# 确保 sysctl.conf 存在
+ensure_sysctl_conf() {
+    if [ ! -f /etc/sysctl.conf ]; then
+        echo "[警告] /etc/sysctl.conf 不存在，正在创建..."
+        touch /etc/sysctl.conf
+        chmod 644 /etc/sysctl.conf
+    fi
 }
 
 check_kernel() {
@@ -157,6 +169,7 @@ test_network() {
 
 apply_entry() {  # 入口节点优化
     backup_configs
+    ensure_sysctl_conf
     echo "[应用] 正在应用【入口节点 TCP 优化】（国内入口机）..."
     
     # 清理旧配置
@@ -230,6 +243,7 @@ EOF
 
 apply_exit() {  # 中转出口优化
     backup_configs
+    ensure_sysctl_conf
     echo "[应用] 正在应用【中转出口 TCP 优化】（国外出口机）..."
     
     sed -i '/^net.ipv4.tcp_no_metrics/d; /^net.ipv4.tcp_ecn/d; /^net.ipv4.tcp_frto/d; /^net.ipv4.tcp_mtu_probing/d; /^net.ipv4.tcp_rfc1337/d; /^net.ipv4.tcp_sack/d; /^net.ipv4.tcp_fack/d; /^net.ipv4.tcp_window_scaling/d; /^net.ipv4.tcp_moderate_rcvbuf/d; /^net.ipv4.tcp_fastopen/d; /^net.ipv4.tcp_slow_start_after_idle/d; /^net.ipv4.tcp_early_retrans/d; /^net.core.rmem/d; /^net.core.wmem/d; /^net.core.somaxconn/d; /^net.core.netdev/d; /^net.ipv4.udp_/d; /^net.ipv4.ip_local/d; /^net.ipv4.tcp_tw_reuse/d; /^net.ipv4.tcp_fin_timeout/d; /^net.ipv4.tcp_keepalive/d; /^net.ipv4.tcp_max/d; /^net.ipv4.tcp_limit_output_bytes/d; /^net.ipv4.tcp_notsent_lowat/d; /^net.core.default_qdisc/d; /^net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
@@ -302,6 +316,7 @@ EOF
 
 apply_exit_land() {  # 终点落地优化
     backup_configs
+    ensure_sysctl_conf
     echo "[应用] 正在应用【终点落地 TCP 优化】（纯落地机）..."
     
     sed -i '/^net.ipv4.tcp_no_metrics/d; /^net.ipv4.tcp_ecn/d; /^net.ipv4.tcp_frto/d; /^net.ipv4.tcp_mtu_probing/d; /^net.ipv4.tcp_rfc1337/d; /^net.ipv4.tcp_sack/d; /^net.ipv4.tcp_fack/d; /^net.ipv4.tcp_window_scaling/d; /^net.ipv4.tcp_moderate_rcvbuf/d; /^net.ipv4.tcp_fastopen/d; /^net.ipv4.tcp_slow_start_after_idle/d; /^net.ipv4.tcp_early_retrans/d; /^net.core.rmem/d; /^net.core.wmem/d; /^net.core.somaxconn/d; /^net.core.netdev/d; /^net.ipv4.udp_/d; /^net.ipv4.ip_local/d; /^net.ipv4.tcp_tw_reuse/d; /^net.ipv4.tcp_fin_timeout/d; /^net.ipv4.tcp_keepalive/d; /^net.ipv4.tcp_max/d; /^net.ipv4.tcp_limit_output_bytes/d; /^net.ipv4.tcp_notsent_lowat/d; /^net.core.default_qdisc/d; /^net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
@@ -374,6 +389,7 @@ EOF
 
 apply_exit_equal_land() {  # 出口等于落地优化
     backup_configs
+    ensure_sysctl_conf
     echo "[应用] 正在应用【出口=落地 TCP 优化】（直连场景）..."
     
     sed -i '/^net.ipv4.tcp_no_metrics/d; /^net.ipv4.tcp_ecn/d; /^net.ipv4.tcp_frto/d; /^net.ipv4.tcp_mtu_probing/d; /^net.ipv4.tcp_rfc1337/d; /^net.ipv4.tcp_sack/d; /^net.ipv4.tcp_fack/d; /^net.ipv4.tcp_window_scaling/d; /^net.ipv4.tcp_moderate_rcvbuf/d; /^net.ipv4.tcp_fastopen/d; /^net.ipv4.tcp_slow_start_after_idle/d; /^net.ipv4.tcp_early_retrans/d; /^net.core.rmem/d; /^net.core.wmem/d; /^net.core.somaxconn/d; /^net.core.netdev/d; /^net.ipv4.udp_/d; /^net.ipv4.ip_local/d; /^net.ipv4.tcp_tw_reuse/d; /^net.ipv4.tcp_fin_timeout/d; /^net.ipv4.tcp_keepalive/d; /^net.ipv4.tcp_max/d; /^net.ipv4.tcp_limit_output_bytes/d; /^net.ipv4.tcp_notsent_lowat/d; /^net.core.default_qdisc/d; /^net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
@@ -446,6 +462,7 @@ EOF
 
 apply_aggressive() {  # 激进优化
     backup_configs
+    ensure_sysctl_conf
     echo "[应用] 正在应用【激进 TCP 优化】（超高带宽）..."
     
     sed -i '/^net.ipv4.tcp_no_metrics/d; /^net.ipv4.tcp_ecn/d; /^net.ipv4.tcp_frto/d; /^net.ipv4.tcp_mtu_probing/d; /^net.ipv4.tcp_rfc1337/d; /^net.ipv4.tcp_sack/d; /^net.ipv4.tcp_fack/d; /^net.ipv4.tcp_window_scaling/d; /^net.ipv4.tcp_moderate_rcvbuf/d; /^net.ipv4.tcp_fastopen/d; /^net.ipv4.tcp_slow_start_after_idle/d; /^net.ipv4.tcp_early_retrans/d; /^net.core.rmem/d; /^net.core.wmem/d; /^net.core.somaxconn/d; /^net.core.netdev/d; /^net.ipv4.udp_/d; /^net.ipv4.ip_local/d; /^net.ipv4.tcp_tw_reuse/d; /^net.ipv4.tcp_fin_timeout/d; /^net.ipv4.tcp_keepalive/d; /^net.ipv4.tcp_max/d; /^net.ipv4.tcp_limit_output_bytes/d; /^net.ipv4.tcp_notsent_lowat/d; /^net.core.default_qdisc/d; /^net.ipv4.tcp_congestion_control/d' /etc/sysctl.conf
@@ -537,6 +554,9 @@ Linux 网络优化管理器 v8 - 使用说明
 v8 是最终版本，已将 BBR+FQ 统一集成到每个 TCP 优化方案中。
 不再需要单独选择拥塞控制算法，一键应用即可。
 
+[Debian 13 特别说明]
+此版本已针对 Debian 13 (trixie) 进行优化，解决了文件系统兼容性问题。
+
 [TCP 优化模式]
 
 1. 入口节点优化
@@ -619,9 +639,10 @@ v8 是最终版本，已将 BBR+FQ 统一集成到每个 TCP 优化方案中。
    - 建议在低峰期应用优化
    - 应用后需重启服务才能完全生效
    - 需要内核 4.9+ 支持 BBR
+   - Debian 13 已完全支持
 
 [恢复配置]
-   使用菜单选项 8，或直接运行备份目录中的 restore.sh
+   使用菜单选项 10，或直接运行备份目录中的 restore.sh
 
 ========================================
 HELP
@@ -630,7 +651,7 @@ HELP
 # ========== 主菜单 ==========
 while true; do
     clear
-    echo "========= Linux 网络优化管理 v8 ========="
+    echo "========= Linux 网络优化管理 v8 (Debian 13) ========="
     echo "主机名: $HOST"
     echo "日期: $(date '+%Y-%m-%d %H:%M:%S')"
     echo "========================================="
